@@ -62,8 +62,8 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 		ctx := r.Context()
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
-			// todo: handle error
-			panic(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		fmt.Printf("body: %v\n", body)
@@ -71,37 +71,31 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 
 		var shortReq ShortUrlRequest
 		if err := json.Unmarshal(body, &shortReq); err != nil {
-			// todo: handle error
-			panic(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
-
-		fmt.Printf("shortReq: %+v\n", shortReq)
 
 		original := shortReq.Url
 
 		// get existing shortened url if it exists
-		fmt.Printf("redis db: %+v\n", rdb.Options().Addr)
-
 		val, err := rdb.Get(ctx, original).Result()
 		if err != nil && err != redis.Nil {
-			// todo: handle error
-			panic(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-
-		fmt.Printf("val: %s\n", val)
 
 		// otherwise, generate and set it
 		if err == redis.Nil {
 			suffix, err := generateRandomUrlSafeString(DefaultNumRandomBytes)
 			if err != nil {
-				// todo: handle error
-				panic(err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
 
 			val = fmt.Sprintf("%s%s", DefaultShortBaseUrl, suffix)
 			if err := rdb.Set(ctx, original, val, 0).Err(); err != nil {
-				// todo: handle error
-				panic(err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
 		}
 
