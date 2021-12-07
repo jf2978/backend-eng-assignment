@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"time"
@@ -29,10 +30,14 @@ type App struct {
 	dataStore *redis.Client
 }
 
+type ShortUrlRequest struct {
+	Url string `json:"url"`
+}
+
 // GreeterHandler returns a closure responsible for
 // greeting the caller with an optional name parameter
-func GreeterHandler() func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
+func GreeterHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 
 		// optional name param
@@ -48,34 +53,65 @@ func GreeterHandler() func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
-	}
+	})
 }
 
-func ShortUrlHandler(rdb *redis.Client) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
+// ShortUrlHandler returns a closure responsible for
+func ShortUrlHandler(rdb *redis.Client) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		// todo: read from request
-
-		// todo: get existing shortened url if it exists
-		val, err := rdb.Get(ctx, "key").Result()
-		if err != nil && err != redis.Nil {
-			// todo: handle error
-		}
-
-		// todo: otherwise set it and return it
-		suffix, err := generateRandomUrlSafeString(DefaultNumRandomBytes)
+		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			// todo: handle error
+			panic(err)
 		}
 
-		shortened := fmt.Sprintf("%s%s", DefaultShortBaseUrl, suffix)
+		fmt.Printf("body: %v\n", body)
+		fmt.Printf("body: %v\n", string(body))
 
-		if err := rdb.Set(ctx, "", shortened, 0).Err(); err != nil {
+		var shortReq ShortUrlRequest
+		if err := json.Unmarshal(body, &shortReq); err != nil {
 			// todo: handle error
+			panic(err)
 		}
 
-		// todo: actually set response
-	}
+		fmt.Printf("shortReq: %+v\n", shortReq)
+
+		original := shortReq.Url
+
+		// get existing shortened url if it exists
+		fmt.Printf("redis db: %+v\n", rdb.Options().Addr)
+
+		val, err := rdb.Get(ctx, original).Result()
+		if err != nil && err != redis.Nil {
+			// todo: handle error
+			panic(err)
+		}
+
+		fmt.Printf("val: %s\n", val)
+
+		// otherwise, generate and set it
+		if err == redis.Nil {
+			suffix, err := generateRandomUrlSafeString(DefaultNumRandomBytes)
+			if err != nil {
+				// todo: handle error
+				panic(err)
+			}
+
+			val = fmt.Sprintf("%s%s", DefaultShortBaseUrl, suffix)
+			if err := rdb.Set(ctx, original, val, 0).Err(); err != nil {
+				// todo: handle error
+				panic(err)
+			}
+		}
+
+		var resp map[string]interface{}
+		json.Unmarshal([]byte(fmt.Sprintf(`{ "shortened": "%s" }`, val)), &resp)
+
+		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
 }
 
 // Init returns a new App with some default values
@@ -84,13 +120,18 @@ func Init() *App {
 
 	// data store
 	rdb := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%s", DefaultAddress, DBPort),
+		Addr:     fmt.Sprintf("%s:%s", "localhost", DBPort),
+		Password: "", // no password set
+		DB:       0,  // use default DB
 	})
+
+	fmt.Printf("redis db: %+v\n", rdb.Options().Addr)
 
 	// routes
 	r := mux.NewRouter()
-	r.HandleFunc("/", GreeterHandler())
-	r.HandleFunc("/{name}/", ShortUrlHandler(rdb))
+	r.Handle("/hello", GreeterHandler())
+	r.Handle("/hello/{name}/", GreeterHandler())
+	r.Handle("/short-url/", ShortUrlHandler(rdb))
 
 	return &App{
 		context:   ctx,
@@ -123,6 +164,7 @@ func generateRandomBytes(n int) ([]byte, error) {
 func main() {
 	app := Init()
 
+	log.Printf("Listening on port %s...\n", ServerPort)
 	log.Fatal(http.ListenAndServe(
 		fmt.Sprintf("%s:%s", DefaultAddress, ServerPort), app.router),
 	)
