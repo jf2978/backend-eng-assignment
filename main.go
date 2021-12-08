@@ -30,8 +30,16 @@ type App struct {
 	dataStore *redis.Client
 }
 
+type ShortUrl struct {
+	Default string `json:"default_url"`
+	Custom  string `json:"custom_url"`
+	// todo: store some metadata here
+}
+
+// ShortUrlRequest represents a req
 type ShortUrlRequest struct {
-	Url string `json:"url"`
+	Original string `json:"url"`
+	Custom   string `json:"custom_suffix"`
 }
 
 // GreeterHandler returns a closure responsible for
@@ -57,6 +65,7 @@ func GreeterHandler() http.Handler {
 }
 
 // ShortUrlHandler returns a closure responsible for
+// fetching or generating a shortened url for the provided original
 func ShortUrlHandler(rdb *redis.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -66,45 +75,57 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 			return
 		}
 
-		fmt.Printf("body: %v\n", body)
-		fmt.Printf("body: %v\n", string(body))
-
 		var shortReq ShortUrlRequest
 		if err := json.Unmarshal(body, &shortReq); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		original := shortReq.Url
+		original, custom := shortReq.Original, shortReq.Custom
 
-		// get existing shortened url if it exists
-		val, err := rdb.Get(ctx, original).Result()
+		var shortUrl ShortUrl
+		serialized, err := rdb.Get(ctx, original).Result()
 		if err != nil && err != redis.Nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// otherwise, generate and set it
+		// if we have the data for this url stored, use that
+		if serialized != "" {
+			if err := json.Unmarshal([]byte(serialized), &shortUrl); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// otherwise, generate a new url
 		if err == redis.Nil {
 			suffix, err := generateRandomUrlSafeString(DefaultNumRandomBytes)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-
-			val = fmt.Sprintf("%s%s", DefaultShortBaseUrl, suffix)
-			if err := rdb.Set(ctx, original, val, 0).Err(); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
+			shortUrl.Default = fmt.Sprintf("%s%s", DefaultShortBaseUrl, suffix)
 		}
 
-		var resp map[string]interface{}
-		json.Unmarshal([]byte(fmt.Sprintf(`{ "shortened": "%s" }`, val)), &resp)
+		// side effect: this will overwrite an existing custom url
+		// with the suffix provided in the request
+		// todo: handle the case where this custom url is already in use
+		if custom != "" {
+			shortUrl.Custom = fmt.Sprintf("%s%s", DefaultShortBaseUrl, custom)
+		}
+
+		fmt.Printf("short url: %v\n", shortUrl)
+
+		rawData, err := json.Marshal(&shortUrl)
+		if err := rdb.Set(ctx, original, string(rawData), 0).Err(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		json.NewEncoder(w).Encode(shortUrl)
 	})
 }
 
@@ -126,6 +147,7 @@ func Init() *App {
 	r.Handle("/hello", GreeterHandler())
 	r.Handle("/hello/{name}/", GreeterHandler())
 	r.Handle("/short-url/", ShortUrlHandler(rdb))
+	r.Handle("/short-url/{custom-url}/", ShortUrlHandler(rdb))
 
 	return &App{
 		context:   ctx,
