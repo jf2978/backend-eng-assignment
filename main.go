@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -81,17 +82,28 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 			return
 		}
 
-		original, custom := shortReq.Original, shortReq.Custom
+		// todo: validate that the original url is non-empty in the request
 
-		var shortUrl ShortUrl
-		serialized, err := rdb.Get(ctx, original).Result()
+		ogHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Original)))
+		customHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Custom)))
+
+		// check to see if we have record of this original url
+		ogRecordId, err := rdb.Get(ctx, ogHash).Result()
 		if err != nil && err != redis.Nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// if we have the data for this url stored, use that
-		if serialized != "" {
+		var shortUrl ShortUrl
+
+		// if we do have an associated record for this url, get it
+		if ogRecordId != "" {
+			serialized, err := rdb.Get(ctx, ogRecordId).Result()
+			if err != nil && err != redis.Nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
 			if err := json.Unmarshal([]byte(serialized), &shortUrl); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -100,25 +112,78 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 
 		// otherwise, generate a new url
 		if err == redis.Nil {
-			suffix, err := generateRandomUrlSafeString(DefaultNumRandomBytes)
-			if err != nil {
+
+			var suffix string
+			var unique bool
+
+			for !unique {
+				b, err := generateRandomBytes(DefaultNumRandomBytes)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				suffix, err = generateRandomUrlSafeString(b)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				// check for collision (highly unlikely, but if found, let's regenerate)
+				if err := rdb.Get(ctx, suffix).Err(); err != nil {
+					if err != redis.Nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+					unique = true
+				}
+			}
+			shortUrl.Default = suffix
+
+		}
+
+		// side effect: this will overwrite an existing custom url with the suffix provided in the request
+		if shortReq.Custom != "" {
+
+			// check if the custom suffix is already in use
+			customRecordId, err := rdb.Get(ctx, customHash).Result()
+
+			if err != nil && err != redis.Nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			shortUrl.Default = fmt.Sprintf("%s%s", DefaultShortBaseUrl, suffix)
+
+			if customRecordId != "" && customRecordId != ogRecordId {
+				http.Error(w, "custom url provided is already in use", http.StatusBadRequest)
+				return
+			}
+
+			// if we either have a matching record or none at all, let's write/update our custom url data
+			shortUrl.Custom = shortReq.Custom
+
 		}
 
-		// side effect: this will overwrite an existing custom url
-		// with the suffix provided in the request
-		// todo: handle the case where this custom url is already in use
-		if custom != "" {
-			shortUrl.Custom = fmt.Sprintf("%s%s", DefaultShortBaseUrl, custom)
+		fullRecordData, err := json.Marshal(&shortUrl)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
-		fmt.Printf("short url: %v\n", shortUrl)
+		// todo: ideally, transactionalize these for consistency
+		// set the full record data (suffix -> JSON{})
+		if err := rdb.Set(ctx, shortUrl.Default, string(fullRecordData), 0).Err(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-		rawData, err := json.Marshal(&shortUrl)
-		if err := rdb.Set(ctx, original, string(rawData), 0).Err(); err != nil {
+		// associate the original url -> record id (suffix)
+		if err := rdb.Set(ctx, ogHash, shortUrl.Default, 0).Err(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// associate the custom url -> record id (suffix)
+		if err := rdb.Set(ctx, customHash, shortUrl.Default, 0).Err(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -146,7 +211,7 @@ func Init() *App {
 	r := mux.NewRouter()
 	r.Handle("/hello", GreeterHandler())
 	r.Handle("/hello/{name}/", GreeterHandler())
-	r.Handle("/short-url/", ShortUrlHandler(rdb))
+	r.Handle("/shorten/", ShortUrlHandler(rdb))
 	r.Handle("/short-url/{custom-url}/", ShortUrlHandler(rdb))
 
 	return &App{
@@ -156,14 +221,8 @@ func Init() *App {
 	}
 }
 
-// generateRandomUrlSafeString will produce n RNG bytes and return them as a url-safe base64-encoded string
-// for our puposes, this means we'd generate |{set of url-safe chars}|^n possible strings
-func generateRandomUrlSafeString(n int) (string, error) {
-	b, err := generateRandomBytes(n)
-	if err != nil {
-		return "", err
-	}
-
+// generateRandomUrlSafeString will return the provided byte slice as a url-safe base64-encoded string
+func generateRandomUrlSafeString(b []byte) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
