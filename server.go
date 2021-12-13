@@ -5,11 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	hdr "github.com/HdrHistogram/hdrhistogram-go"
@@ -269,8 +272,6 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 					return
 				}
 
-				fmt.Printf("decoded metadata: %v\n", shortUrl.Metadata)
-
 				w.WriteHeader(http.StatusOK)
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(shortUrl.Metadata)
@@ -297,8 +298,6 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-
-			fmt.Printf("decoded metadata: %v\n", shortUrl.Metadata)
 
 			w.WriteHeader(http.StatusOK)
 			w.Header().Set("Content-Type", "application/json")
@@ -392,13 +391,14 @@ func (s *ShortUrl) generateUniqueSuffix(ctx context.Context, rdb *redis.Client) 
 // initMetadata initializes ShortUrl metadata (namely setting created_at and the encoded histogram)
 func (s *ShortUrl) initMetadata(ctx context.Context) error {
 	now := time.Now()
+	oneMonthFromNow := now.Add(time.Hour * 24 * 30)
+
 	s.Metadata.CreatedAt = now
 
-	start, end := now, now.Add(time.Hour*24*30)
-
-	hist := hdr.New(now.UnixMilli(), now.Add(time.Hour*24*30).UnixMilli(), 1)
-	hist.SetStartTimeMs(start.UnixMilli())
-	hist.SetEndTimeMs(end.UnixMilli())
+	// todo: truncate the start/end time of the histogram produced (instead of during export)
+	hist := hdr.New(100000, oneMonthFromNow.Unix(), 5)
+	hist.SetStartTimeMs(now.UnixMilli())
+	hist.SetEndTimeMs(oneMonthFromNow.UnixMilli())
 
 	encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
 	if err != nil {
@@ -416,8 +416,46 @@ func (s *ShortUrl) getMetadata(ctx context.Context) error {
 		return err
 	}
 
+	// create/open local csv file
+	f, err := os.Create("histogram.csv")
+	defer f.Close()
+
+	if err != nil {
+		return err
+	}
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	records := [][]string{
+		{"from", "to", "count"},
+	}
+
+	// format the histogram time range & count values
+	thisYear := time.Date(2021, time.January, 1, 0, 0, 0, 0, time.Local)
+
 	for _, v := range hist.Distribution() {
-		s.Metadata.Distribution += v.String()
+		// skip over dates before this year
+		if time.Unix(v.From, 0).Before(thisYear) {
+			continue
+		}
+
+		from := time.Unix(v.From, 0).Format(time.RFC3339)
+		to := time.Unix(v.To, 0).Format(time.RFC3339)
+
+		record := strings.Split(fmt.Sprintf("%s,%s,%d", from, to, v.Count), ",")
+		records = append(records, record)
+	}
+
+	// write the file (to buffer)
+	for _, record := range records {
+		if err := w.Write(record); err != nil {
+			return err
+		}
+	}
+
+	if err := w.Error(); err != nil {
+		return err
 	}
 
 	return nil
@@ -431,7 +469,7 @@ func (s *ShortUrl) updateMetadata(ctx context.Context, rdb *redis.Client) error 
 		return err
 	}
 
-	if err := hist.RecordValue(now.UnixMilli()); err != nil {
+	if err := hist.RecordValue(now.Unix()); err != nil {
 		return err
 	}
 
