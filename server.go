@@ -43,7 +43,7 @@ type ShortUrl struct {
 }
 
 type Metadata struct {
-	CreatedAt    time.Time `json:"created_at`
+	CreatedAt    time.Time `json:"created_at"`
 	Visits       int64     `json:"visits"`
 	EncodedHist  []byte    `json:"encoded_hist"`
 	Distribution string    `json:"-"` // ignore during (un)marshalling
