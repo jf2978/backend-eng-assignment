@@ -77,7 +77,6 @@ func GreeterHandler() http.Handler {
 // fetching or generating a shortened url for the provided original
 func ShortUrlHandler(rdb *redis.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		now := time.Now()
 		ctx := r.Context()
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -96,92 +95,44 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 			return
 		}
 
-		ogHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Original)))
-		customHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Custom)))
+		var shortUrl ShortUrl
+		shortUrl.Original = shortReq.Original
 
-		// check to see if we have record of this original url
-		ogRecordId, err := rdb.Get(ctx, ogHash).Result()
+		err = shortUrl.getByOriginal(ctx, rdb, shortReq.Original)
 		if err != nil && err != redis.Nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		var shortUrl ShortUrl
-
-		shortUrl.Original = shortReq.Original
-
-		// if we do have an associated record for this url, get it
-		if ogRecordId != "" {
-			serialized, err := rdb.Get(ctx, ogRecordId).Result()
-			if err != nil && err != redis.Nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			if err := json.Unmarshal([]byte(serialized), &shortUrl); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-
 		// otherwise, generate a new url
 		if err == redis.Nil {
-
-			var suffix string
-			var unique bool
-
-			for !unique {
-				b, err := generateRandomBytes(DefaultNumRandomBytes)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				suffix, err = generateRandomUrlSafeString(b)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				// check for collision (highly unlikely, but if found, let's regenerate)
-				if err := rdb.Get(ctx, suffix).Err(); err != nil {
-					if err != redis.Nil {
-						http.Error(w, err.Error(), http.StatusInternalServerError)
-						return
-					}
-					unique = true
-				}
-			}
-			shortUrl.Default = suffix
-			shortUrl.Metadata.CreatedAt = now
-
-			start, end := now, now.Add(time.Hour*24*30)
-			hist := hdr.New(now.UnixMilli(), now.Add(time.Hour*24*30).UnixMilli(), 1)
-			hist.SetStartTimeMs(start.UnixMilli())
-			hist.SetEndTimeMs(end.UnixMilli())
-
-			encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
-			if err != nil {
+			if err := shortUrl.generateUniqueSuffix(ctx, rdb); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			shortUrl.Metadata.EncodedHist = encodedHist
+
+			if err := shortUrl.initMetadata(ctx); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 
-		// side effect: this will NOT overwrite an existing (hash) custom suffix
-		// todo: handle data edge cases (allow multiple custom urls per record or delete existing custom hashes, etc)
+		customHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Custom)))
+
+		// side effect: this will NOT overwrite an existing custom suffix for the current record
+		// i.e. a single original url can be mapped to multiple custom suffixes
 		if shortReq.Custom != "" {
 
 			// check if the custom suffix is already in use (both as someone
 			// else's custom url or the unlikely case that this was a generated suffix)
-			customRecordId, err := rdb.Get(ctx, customHash).Result()
+			recordId, err := rdb.Get(ctx, customHash).Result()
 
 			if err != nil && err != redis.Nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			if customRecordId != "" && customRecordId != ogRecordId {
+			if recordId != "" && recordId != shortUrl.Default {
 				http.Error(w, "custom url provided is already in use", http.StatusBadRequest)
 				return
 			}
@@ -197,6 +148,7 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 		}
 
 		// todo: ideally, transactionalize these for consistency
+
 		// set the full record data (suffix -> JSON{})
 		if err := rdb.Set(ctx, shortUrl.Default, string(fullRecordData), 0).Err(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -204,6 +156,7 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 		}
 
 		// associate the original url (hash) -> record id (suffix)
+		ogHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Original)))
 		if err := rdb.Set(ctx, ogHash, shortUrl.Default, 0).Err(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -247,6 +200,8 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 		// if we have the full record aleady, we can just redirect
 		if rec != "" {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+				// todo: refactor -> updateMetadata(rdb, &shortUrl)
+
 				// update metadata before redirecting
 				hist, err := hdr.Decode(shortUrl.Metadata.EncodedHist)
 				if err != nil {
@@ -300,7 +255,8 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 		}
 
 		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
-			// update metadata before redirecting
+			// todo: refactor -> updateMetadata(rdb, &shortUrl)
+
 			hist, err := hdr.Decode(shortUrl.Metadata.EncodedHist)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -369,6 +325,8 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
 				meta := shortUrl.Metadata
 
+				// todo: refactor -> getMetadata(&shortUrl) ()
+
 				hist, err := hdr.Decode(meta.EncodedHist)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -382,8 +340,6 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 					fmt.Printf("bar: %+v\n", v.String())
 				}
 
-				// todo: print or save a snapshot of the histogram at this point
-				// and return it to the client
 				w.WriteHeader(http.StatusOK)
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(meta)
@@ -417,7 +373,7 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 			fmt.Printf("histogram distribution: %+v\n", hist.Distribution())
 
 			for _, v := range hist.Distribution() {
-				fmt.Printf("bar: %+v\n", v.String())
+				fmt.Printf("bar: %+v", v.String())
 			}
 
 			fmt.Printf("histogram distribution: %+v\n", hist.TotalCount())
@@ -457,6 +413,81 @@ func InitServer() *Server {
 		router:    r,
 		dataStore: rdb,
 	}
+}
+
+func (s *ShortUrl) getByOriginal(ctx context.Context, rdb *redis.Client, original string) error {
+	ogHash := fmt.Sprintf("%x", sha256.Sum256([]byte(original)))
+
+	recordId, err := rdb.Get(ctx, ogHash).Result()
+	if err != nil {
+		return err
+	}
+
+	if recordId != "" {
+		s.Default = recordId
+		serialized, err := rdb.Get(ctx, recordId).Result()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+
+		if err := json.Unmarshal([]byte(serialized), s); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// generateUniqueSuffix generates a unique url-safe base64 encoded suffix for this ShortUrl
+func (s *ShortUrl) generateUniqueSuffix(ctx context.Context, rdb *redis.Client) error {
+
+	var suffix string
+	var unique bool
+
+	for !unique {
+		b, err := generateRandomBytes(DefaultNumRandomBytes)
+		if err != nil {
+			return err
+		}
+
+		suffix, err = generateRandomUrlSafeString(b)
+		if err != nil {
+			return err
+		}
+
+		// check for collision (highly unlikely, but if found, let's regenerate)
+		if err := rdb.Get(ctx, suffix).Err(); err != nil {
+			if err != redis.Nil {
+				return err
+			}
+			unique = true
+		}
+	}
+
+	s.Default = suffix
+
+	return nil
+}
+
+// initMetadata initializes ShortUrl metadata (namely setting created_at and the encoded histogram)
+func (s *ShortUrl) initMetadata(ctx context.Context) error {
+	now := time.Now()
+	s.Metadata.CreatedAt = now
+
+	start, end := now, now.Add(time.Hour*24*30)
+
+	hist := hdr.New(now.UnixMilli(), now.Add(time.Hour*24*30).UnixMilli(), 1)
+	hist.SetStartTimeMs(start.UnixMilli())
+	hist.SetEndTimeMs(end.UnixMilli())
+
+	encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
+	if err != nil {
+		return err
+	}
+
+	s.Metadata.EncodedHist = encodedHist
+
+	return nil
 }
 
 // generateRandomUrlSafeString will return the provided byte slice as a url-safe base64-encoded string
