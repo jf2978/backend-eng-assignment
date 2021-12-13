@@ -32,8 +32,9 @@ type App struct {
 }
 
 type ShortUrl struct {
-	Default string `json:"default_url"`
-	Custom  string `json:"custom_url"`
+	Original string `json:"original_url"`
+	Default  string `json:"default_url"`
+	Custom   string `json:"custom_url"`
 	// todo: store some metadata here
 }
 
@@ -78,11 +79,14 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 
 		var shortReq ShortUrlRequest
 		if err := json.Unmarshal(body, &shortReq); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "provided payload is not valid JSON", http.StatusBadRequest)
 			return
 		}
 
-		// todo: validate that the original url is non-empty in the request
+		if shortReq.Original == "" {
+			http.Error(w, "required param 'url' is empty", http.StatusBadRequest)
+			return
+		}
 
 		ogHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Original)))
 		customHash := fmt.Sprintf("%x", sha256.Sum256([]byte(shortReq.Custom)))
@@ -95,6 +99,8 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 		}
 
 		var shortUrl ShortUrl
+
+		shortUrl.Original = shortReq.Original
 
 		// if we do have an associated record for this url, get it
 		if ogRecordId != "" {
@@ -139,13 +145,14 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 				}
 			}
 			shortUrl.Default = suffix
-
 		}
 
-		// side effect: this will overwrite an existing custom url with the suffix provided in the request
+		// side effect: this will NOT overwrite an existing custom url
+		// if the same original url has one already set
 		if shortReq.Custom != "" {
 
-			// check if the custom suffix is already in use
+			// check if the custom suffix is already in use (both as someone
+			// else's custom url or the unlikely case that this was a generated suffix)
 			customRecordId, err := rdb.Get(ctx, customHash).Result()
 
 			if err != nil && err != redis.Nil {
@@ -160,7 +167,6 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 
 			// if we either have a matching record or none at all, let's write/update our custom url data
 			shortUrl.Custom = shortReq.Custom
-
 		}
 
 		fullRecordData, err := json.Marshal(&shortUrl)
@@ -176,13 +182,13 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 			return
 		}
 
-		// associate the original url -> record id (suffix)
+		// associate the original url (hash) -> record id (suffix)
 		if err := rdb.Set(ctx, ogHash, shortUrl.Default, 0).Err(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// associate the custom url -> record id (suffix)
+		// associate the custom url (hash) -> record id (suffix)
 		if err := rdb.Set(ctx, customHash, shortUrl.Default, 0).Err(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -191,6 +197,68 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(shortUrl)
+	})
+}
+
+// RedirectHandler returns a closure responsible for
+// redirecting a default or custom url to its original
+func RedirectHandler(rdb *redis.Client) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		vars := mux.Vars(r)
+		suffix := vars["suffix"]
+
+		if suffix == "" {
+			http.Error(w, "redirect url is empty", http.StatusBadRequest)
+			return
+		}
+
+		// check if we have record of this suffix
+		rec, err := rdb.Get(ctx, suffix).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var shortUrl ShortUrl
+
+		fmt.Printf("suffix : %+v\n", suffix)
+		fmt.Printf("rec : %+v\n", rec)
+
+		// if we have the full record aleady, we can just redirect
+		if rec != "" {
+			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+				http.Redirect(w, r, shortUrl.Original, http.StatusFound)
+				return
+			}
+		}
+
+		// otherwise, try looking for it by the custom suffix hash
+		customHash := fmt.Sprintf("%x", sha256.Sum256([]byte(suffix)))
+		recId, err := rdb.Get(ctx, customHash).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Printf("custom hash : %+v\n", customHash)
+		fmt.Printf("rec id: %+v\n", recId)
+
+		rec, err = rdb.Get(ctx, recId).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Printf("rec: %+v\n", rec)
+
+		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+			http.Redirect(w, r, shortUrl.Original, http.StatusFound)
+			return
+		}
+
+		http.Error(w, fmt.Sprintf("could not redirect url: %s\n", suffix), http.StatusNotFound)
+		return
 	})
 }
 
@@ -212,7 +280,7 @@ func Init() *App {
 	r.Handle("/hello", GreeterHandler())
 	r.Handle("/hello/{name}/", GreeterHandler())
 	r.Handle("/shorten/", ShortUrlHandler(rdb))
-	r.Handle("/short-url/{custom-url}/", ShortUrlHandler(rdb))
+	r.Handle("/{suffix}/", RedirectHandler(rdb))
 
 	return &App{
 		context:   ctx,
