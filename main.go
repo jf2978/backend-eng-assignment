@@ -147,8 +147,8 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 			shortUrl.Default = suffix
 		}
 
-		// side effect: this will NOT overwrite an existing custom url
-		// if the same original url has one already set
+		// side effect: this will NOT overwrite an existing (hash) custom suffix
+		// todo: handle data edge cases (allow multiple custom urls per record or delete existing custom hashes, etc)
 		if shortReq.Custom != "" {
 
 			// check if the custom suffix is already in use (both as someone
@@ -222,9 +222,6 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 
 		var shortUrl ShortUrl
 
-		fmt.Printf("suffix : %+v\n", suffix)
-		fmt.Printf("rec : %+v\n", rec)
-
 		// if we have the full record aleady, we can just redirect
 		if rec != "" {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
@@ -241,16 +238,11 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 			return
 		}
 
-		fmt.Printf("custom hash : %+v\n", customHash)
-		fmt.Printf("rec id: %+v\n", recId)
-
 		rec, err = rdb.Get(ctx, recId).Result()
 		if err != nil && err != redis.Nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		fmt.Printf("rec: %+v\n", rec)
 
 		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
 			http.Redirect(w, r, shortUrl.Original, http.StatusFound)
