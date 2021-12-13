@@ -40,9 +40,10 @@ type ShortUrl struct {
 }
 
 type Metadata struct {
-	CreatedAt   time.Time `json:"created_at`
-	Visits      int64     `json:"visits"`
-	EncodedHist []byte    `json:"encoded_hist"`
+	CreatedAt    time.Time `json:"created_at`
+	Visits       int64     `json:"visits"`
+	EncodedHist  []byte    `json:"encoded_hist"`
+	Distribution string    `json:"-"` // ignore during (un)marshalling
 }
 
 // ShortUrlRequest represents a req
@@ -178,7 +179,6 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 // redirecting a default or custom url to its original
 func RedirectHandler(rdb *redis.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		now := time.Now()
 		ctx := r.Context()
 		vars := mux.Vars(r)
 		suffix := vars["suffix"]
@@ -200,37 +200,7 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 		// if we have the full record aleady, we can just redirect
 		if rec != "" {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
-				// todo: refactor -> updateMetadata(rdb, &shortUrl)
-
-				// update metadata before redirecting
-				hist, err := hdr.Decode(shortUrl.Metadata.EncodedHist)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				if err := hist.RecordValue(now.UnixMilli()); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				fmt.Printf("recorded value: %v\n", now.UnixMilli())
-
-				encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				shortUrl.Metadata.EncodedHist = encodedHist
-				shortUrl.Metadata.Visits++
-
-				serialized, err := json.Marshal(&shortUrl)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				if err := rdb.Set(ctx, shortUrl.Default, string(serialized), 0).Err(); err != nil {
+				if err := shortUrl.updateMetadata(ctx, rdb); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -255,36 +225,7 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 		}
 
 		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
-			// todo: refactor -> updateMetadata(rdb, &shortUrl)
-
-			hist, err := hdr.Decode(shortUrl.Metadata.EncodedHist)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			if err := hist.RecordValue(now.UnixMilli()); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			fmt.Printf("recorded value: %v\n", now.UnixMilli())
-
-			encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			shortUrl.Metadata.EncodedHist = encodedHist
-			shortUrl.Metadata.Visits++
-
-			serialized, err := json.Marshal(&shortUrl)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			if err := rdb.Set(ctx, shortUrl.Default, string(serialized), 0).Err(); err != nil {
+			if err := shortUrl.updateMetadata(ctx, rdb); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -323,26 +264,16 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 		// if we have the full record aleady, we can just get that
 		if rec != "" {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
-				meta := shortUrl.Metadata
-
-				// todo: refactor -> getMetadata(&shortUrl) ()
-
-				hist, err := hdr.Decode(meta.EncodedHist)
-				if err != nil {
+				if err := shortUrl.getMetadata(ctx); err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
 
-				fmt.Printf("histogram distribution: %+v\n", hist.Distribution())
-				fmt.Printf("histogram distribution: %+v\n", hist.TotalCount())
-
-				for _, v := range hist.Distribution() {
-					fmt.Printf("bar: %+v\n", v.String())
-				}
+				fmt.Printf("decoded metadata: %v\n", shortUrl.Metadata)
 
 				w.WriteHeader(http.StatusOK)
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(meta)
+				json.NewEncoder(w).Encode(shortUrl.Metadata)
 				return
 			}
 		}
@@ -362,27 +293,16 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 		}
 
 		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
-			meta := shortUrl.Metadata
-
-			hist, err := hdr.Decode(meta.EncodedHist)
-			if err != nil {
+			if err := shortUrl.getMetadata(ctx); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			fmt.Printf("hist: %+v\n", hist)
-			fmt.Printf("histogram distribution: %+v\n", hist.Distribution())
 
-			for _, v := range hist.Distribution() {
-				fmt.Printf("bar: %+v", v.String())
-			}
+			fmt.Printf("decoded metadata: %v\n", shortUrl.Metadata)
 
-			fmt.Printf("histogram distribution: %+v\n", hist.TotalCount())
-
-			// todo: print or save a snapshot of the histogram at this point
-			// and return it to the client (instead of returning the encoded one)
 			w.WriteHeader(http.StatusOK)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(meta)
+			json.NewEncoder(w).Encode(shortUrl.Metadata)
 			return
 		}
 
@@ -486,6 +406,50 @@ func (s *ShortUrl) initMetadata(ctx context.Context) error {
 	}
 
 	s.Metadata.EncodedHist = encodedHist
+
+	return nil
+}
+
+func (s *ShortUrl) getMetadata(ctx context.Context) error {
+	hist, err := hdr.Decode(s.Metadata.EncodedHist)
+	if err != nil {
+		return err
+	}
+
+	for _, v := range hist.Distribution() {
+		s.Metadata.Distribution += v.String()
+	}
+
+	return nil
+}
+
+// updateMetadata updates the ShortUrl visit count and histogram data
+func (s *ShortUrl) updateMetadata(ctx context.Context, rdb *redis.Client) error {
+	now := time.Now()
+	hist, err := hdr.Decode(s.Metadata.EncodedHist)
+	if err != nil {
+		return err
+	}
+
+	if err := hist.RecordValue(now.UnixMilli()); err != nil {
+		return err
+	}
+
+	encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
+	if err != nil {
+		return err
+	}
+	s.Metadata.EncodedHist = encodedHist
+	s.Metadata.Visits++
+
+	serialized, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+
+	if err := rdb.Set(ctx, s.Default, string(serialized), 0).Err(); err != nil {
+		return err
+	}
 
 	return nil
 }
