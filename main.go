@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	hdr "github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
 )
@@ -32,10 +33,16 @@ type App struct {
 }
 
 type ShortUrl struct {
-	Original string `json:"original_url"`
-	Default  string `json:"default_url"`
-	Custom   string `json:"custom_url"`
-	// todo: store some metadata here
+	Original string   `json:"original_url"`
+	Default  string   `json:"default_url"`
+	Custom   string   `json:"custom_url"`
+	Metadata Metadata `json:"metadata"`
+}
+
+type Metadata struct {
+	CreatedAt   time.Time `json:"created_at`
+	Visits      int64     `json:"visits"`
+	EncodedHist []byte    `json:"encoded_hist"`
 }
 
 // ShortUrlRequest represents a req
@@ -70,6 +77,7 @@ func GreeterHandler() http.Handler {
 // fetching or generating a shortened url for the provided original
 func ShortUrlHandler(rdb *redis.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := time.Now()
 		ctx := r.Context()
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -145,6 +153,19 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 				}
 			}
 			shortUrl.Default = suffix
+			shortUrl.Metadata.CreatedAt = now
+
+			start, end := now, now.Add(time.Hour*24*30)
+			hist := hdr.New(now.UnixMilli(), now.Add(time.Hour*24*30).UnixMilli(), 1)
+			hist.SetStartTimeMs(start.UnixMilli())
+			hist.SetEndTimeMs(end.UnixMilli())
+
+			encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			shortUrl.Metadata.EncodedHist = encodedHist
 		}
 
 		// side effect: this will NOT overwrite an existing (hash) custom suffix
@@ -204,6 +225,7 @@ func ShortUrlHandler(rdb *redis.Client) http.Handler {
 // redirecting a default or custom url to its original
 func RedirectHandler(rdb *redis.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := time.Now()
 		ctx := r.Context()
 		vars := mux.Vars(r)
 		suffix := vars["suffix"]
@@ -225,6 +247,27 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 		// if we have the full record aleady, we can just redirect
 		if rec != "" {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+				// update metadata before redirecting
+				hist, err := hdr.Decode(shortUrl.Metadata.EncodedHist)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				hist.RecordValue(now.UnixMilli())
+				shortUrl.Metadata.Visits++
+
+				serialized, err := json.Marshal(&shortUrl)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				if err := rdb.Set(ctx, shortUrl.Default, string(serialized), 0).Err(); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
 				http.Redirect(w, r, shortUrl.Original, http.StatusFound)
 				return
 			}
@@ -245,12 +288,97 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 		}
 
 		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+			// update metadata before redirecting
+			hist, err := hdr.Decode(shortUrl.Metadata.EncodedHist)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			hist.RecordValue(now.UnixMilli())
+			shortUrl.Metadata.Visits++
+
+			serialized, err := json.Marshal(&shortUrl)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			if err := rdb.Set(ctx, shortUrl.Default, string(serialized), 0).Err(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
 			http.Redirect(w, r, shortUrl.Original, http.StatusFound)
 			return
 		}
 
 		http.Error(w, fmt.Sprintf("could not redirect url: %s\n", suffix), http.StatusNotFound)
 		return
+	})
+}
+
+// InfoHandler returns a closure responsible for
+// returning metadata for the provided url
+func InfoHandler(rdb *redis.Client) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		vars := mux.Vars(r)
+		suffix := vars["suffix"]
+
+		if suffix == "" {
+			http.Error(w, "url is empty", http.StatusBadRequest)
+			return
+		}
+
+		// check if we have record of this suffix
+		rec, err := rdb.Get(ctx, suffix).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var shortUrl ShortUrl
+
+		// if we have the full record aleady, we can just get that
+		if rec != "" {
+			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+				meta := shortUrl.Metadata
+
+				// todo: print or save a snapshot of the histogram at this point
+				// and return it to the client
+				w.WriteHeader(http.StatusOK)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(meta)
+				return
+			}
+		}
+
+		// otherwise, try looking for it by the custom suffix hash
+		customHash := fmt.Sprintf("%x", sha256.Sum256([]byte(suffix)))
+		recId, err := rdb.Get(ctx, customHash).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		rec, err = rdb.Get(ctx, recId).Result()
+		if err != nil && err != redis.Nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
+			meta := shortUrl.Metadata
+
+			// todo: print or save a snapshot of the histogram at this point
+			// and return it to the client (instead of returning the encoded one)
+			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(meta)
+			return
+		}
+
 	})
 }
 
@@ -273,6 +401,7 @@ func Init() *App {
 	r.Handle("/hello/{name}/", GreeterHandler())
 	r.Handle("/shorten/", ShortUrlHandler(rdb))
 	r.Handle("/{suffix}/", RedirectHandler(rdb))
+	r.Handle("/{suffix}/stats/", InfoHandler(rdb))
 
 	return &App{
 		context:   ctx,
