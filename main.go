@@ -254,7 +254,19 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 					return
 				}
 
-				hist.RecordValue(now.UnixMilli())
+				if err := hist.RecordValue(now.UnixMilli()); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				fmt.Printf("recorded value: %v\n", now.UnixMilli())
+
+				encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				shortUrl.Metadata.EncodedHist = encodedHist
 				shortUrl.Metadata.Visits++
 
 				serialized, err := json.Marshal(&shortUrl)
@@ -295,7 +307,19 @@ func RedirectHandler(rdb *redis.Client) http.Handler {
 				return
 			}
 
-			hist.RecordValue(now.UnixMilli())
+			if err := hist.RecordValue(now.UnixMilli()); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			fmt.Printf("recorded value: %v\n", now.UnixMilli())
+
+			encodedHist, err := hist.Encode(hdr.V2CompressedEncodingCookieBase)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			shortUrl.Metadata.EncodedHist = encodedHist
 			shortUrl.Metadata.Visits++
 
 			serialized, err := json.Marshal(&shortUrl)
@@ -345,6 +369,19 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 			if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
 				meta := shortUrl.Metadata
 
+				hist, err := hdr.Decode(meta.EncodedHist)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				fmt.Printf("histogram distribution: %+v\n", hist.Distribution())
+				fmt.Printf("histogram distribution: %+v\n", hist.TotalCount())
+
+				for _, v := range hist.Distribution() {
+					fmt.Printf("bar: %+v\n", v.String())
+				}
+
 				// todo: print or save a snapshot of the histogram at this point
 				// and return it to the client
 				w.WriteHeader(http.StatusOK)
@@ -370,6 +407,20 @@ func InfoHandler(rdb *redis.Client) http.Handler {
 
 		if err := json.Unmarshal([]byte(rec), &shortUrl); err == nil {
 			meta := shortUrl.Metadata
+
+			hist, err := hdr.Decode(meta.EncodedHist)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			fmt.Printf("hist: %+v\n", hist)
+			fmt.Printf("histogram distribution: %+v\n", hist.Distribution())
+
+			for _, v := range hist.Distribution() {
+				fmt.Printf("bar: %+v\n", v.String())
+			}
+
+			fmt.Printf("histogram distribution: %+v\n", hist.TotalCount())
 
 			// todo: print or save a snapshot of the histogram at this point
 			// and return it to the client (instead of returning the encoded one)
@@ -401,7 +452,7 @@ func Init() *App {
 	r.Handle("/hello/{name}/", GreeterHandler())
 	r.Handle("/shorten/", ShortUrlHandler(rdb))
 	r.Handle("/{suffix}/", RedirectHandler(rdb))
-	r.Handle("/{suffix}/stats/", InfoHandler(rdb))
+	r.Handle("/{suffix}/stats/", InfoHandler(rdb)) // todo: handle non-trailing slash
 
 	return &App{
 		context:   ctx,
