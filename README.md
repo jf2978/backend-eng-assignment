@@ -1,7 +1,4 @@
-# Range Take Home Exercise (Backend)
-Hey there! I'm Jeff, and I'd love to join the engineering team at [Range](https://range.co), so here's that take-home assignment.
-
-The intention of this file is to document some of my thinking as I as I try to understand the task, make some tradeoffs, and land on a solution.
+Take Home Exercise (Backend)
 
 ## Problem
 Write a server that acts as a bit.ly-like URL shortener (as a JSON API)
